@@ -70,10 +70,12 @@ colab access grant <username>
 colab docs list --json
 colab docs show <doc_id> --json
 colab docs download <doc_id> -o ./document.pdf
+colab docs task-status <task_id> --json
 colab docs upload ./note.txt --title 标题 --document-type 公司纪要 --storage-path 投研资料库 --tag 待分类 --json
 colab docs upload ./batch-a.pdf ./batch-b.pdf --pending --json
 colab docs upload ./incoming --recursive --pending --storage-path 投研资料库 --json
 colab docs upload ./batch-a.pdf ./batch-b.pdf --metadata-json ./metadata.json --json
+colab docs upload ./incoming --recursive --pending --no-wait --jobs 3 --json
 colab docs update <doc_id> --title 新标题 --tag 待分类 --json
 ```
 
@@ -86,6 +88,10 @@ colab docs update <doc_id> --title 新标题 --tag 待分类 --json
   - classify first with another LLM
 - if you choose LLM classification, the CLI prints a prompt you can send to another model
 - save the returned JSON and pass it back with `--metadata-json`
+- add `--no-wait` if you want the CLI to return as soon as the server accepts the file
+- add `--jobs 3` or similar for bounded upload concurrency
+- once `--no-wait` reports accepted task IDs, the sender may close the terminal
+- use `colab docs task-status <task_id>` later to query a single async upload task
 
 Example:
 

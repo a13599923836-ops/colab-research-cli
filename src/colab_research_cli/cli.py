@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
@@ -218,6 +219,7 @@ def upload_one_document(
     correspondent: str,
     storage_path: str,
     tags: list[str],
+    wait_for_result: bool,
 ) -> Any:
     form_data: dict[str, str] = {}
     for key, value in (
@@ -235,6 +237,7 @@ def upload_one_document(
         return api_request(
             "POST",
             "/documents/upload",
+            params={"wait": "true" if wait_for_result else "false"},
             data=form_data,
             files={"document": (file.name, fh, "application/octet-stream")},
         )
@@ -242,6 +245,10 @@ def upload_one_document(
 
 def terminal_is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def current_command_name() -> str:
+    return Path(sys.argv[0]).name or "colab"
 
 
 def metadata_present(
@@ -619,6 +626,21 @@ def docs_download(
     raise typer.BadParameter(f"下载失败：{last_error}")
 
 
+@docs_app.command("task-status")
+def docs_task_status(
+    task_id: str,
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    payload = api_request("GET", f"/documents/tasks/{task_id}")
+    if as_json:
+        emit(payload, as_json=True)
+        return
+    typer.echo(f"Task ID: {payload['task_id']}")
+    typer.echo(f"状态: {payload['status']}")
+    typer.echo(f"文档 ID: {payload.get('related_document') or '-'}")
+    typer.echo(f"结果: {payload.get('result') or '-'}")
+
+
 @docs_app.command("upload")
 def docs_upload(
     paths: list[Path] = typer.Argument(
@@ -635,6 +657,17 @@ def docs_upload(
     storage_path: str = typer.Option("", "--storage-path"),
     tag: list[str] = typer.Option(None, "--tag"),
     pending: bool = typer.Option(False, "--pending", help="自动追加“待分类”标签，适合先入库后分类。"),
+    no_wait: bool = typer.Option(
+        False,
+        "--no-wait",
+        "--async",
+        help="文件成功投递到服务器后立即返回 task_id，不等待 OCR/入库完成。",
+    ),
+    jobs: int = typer.Option(
+        1,
+        "--jobs",
+        help="同时上传的文件数。建议从 2 到 4 开始。",
+    ),
     metadata_json: Path | None = typer.Option(
         None,
         "--metadata-json",
@@ -652,6 +685,12 @@ def docs_upload(
     files = expand_upload_inputs(paths, recursive=recursive)
     if not files:
         raise typer.BadParameter("没有找到可上传的文件。")
+    if jobs < 1:
+        raise typer.BadParameter("--jobs 不能小于 1。")
+    if jobs > 6:
+        raise typer.BadParameter("当前建议把 --jobs 控制在 6 以内。")
+    if stop_on_error and jobs > 1:
+        raise typer.BadParameter("--stop-on-error 暂不支持和 --jobs > 1 同时使用。")
 
     if len(files) > 1 and title and metadata_json is None:
         raise typer.BadParameter("批量上传时不支持给所有文件共用同一个 --title，请改为单文件上传或移除 --title。")
@@ -677,77 +716,124 @@ def docs_upload(
         typer.echo("保存后可执行：")
         quoted_files = " ".join(shlex.quote(str(file)) for file in files)
         typer.echo(
-            f"venv/bin/python colab_cli.py docs upload {quoted_files} --metadata-json ./metadata.json --json"
+            f"{current_command_name()} docs upload {quoted_files} --metadata-json ./metadata.json --json"
         )
         raise typer.Exit(code=0)
 
     metadata_by_file = load_metadata_json(metadata_json, files) if metadata_json else {}
     tags = merge_upload_tags(tag, pending=pending)
-    results: list[dict[str, Any]] = []
-
+    planned_uploads: list[dict[str, Any]] = []
     for file in files:
+        file_metadata = metadata_by_file.get(file, {})
+        planned_uploads.append(
+            {
+                "file": file,
+                "title": file_metadata.get("title", "") or title,
+                "document_type": file_metadata.get("document_type", "") or document_type,
+                "correspondent": file_metadata.get("correspondent", "") or correspondent,
+                "storage_path": file_metadata.get("storage_path", "") or storage_path,
+                "tags": merge_upload_tags(
+                    [*tags, *file_metadata.get("tags", [])],
+                    pending=False,
+                ),
+            }
+        )
+
+    results: list[dict[str, Any] | None] = [None] * len(planned_uploads)
+    worker_count = min(jobs, len(planned_uploads))
+
+    def run_one(index: int, upload_plan: dict[str, Any]) -> dict[str, Any]:
+        file = upload_plan["file"]
         try:
-            file_metadata = metadata_by_file.get(file, {})
-            merged_tags = merge_upload_tags(
-                [*tags, *file_metadata.get("tags", [])],
-                pending=False,
-            )
             payload = upload_one_document(
                 file,
-                title=file_metadata.get("title", "") or title,
-                document_type=file_metadata.get("document_type", "") or document_type,
-                correspondent=file_metadata.get("correspondent", "") or correspondent,
-                storage_path=file_metadata.get("storage_path", "") or storage_path,
-                tags=merged_tags,
+                title=upload_plan["title"],
+                document_type=upload_plan["document_type"],
+                correspondent=upload_plan["correspondent"],
+                storage_path=upload_plan["storage_path"],
+                tags=upload_plan["tags"],
+                wait_for_result=not no_wait,
             )
-            results.append(
-                {
-                    "file": str(file),
-                    "ok": True,
-                    "result": payload,
-                }
-            )
-            if not as_json and len(files) > 1:
-                typer.echo(f"[OK] {file}")
+            return {
+                "file": str(file),
+                "ok": True,
+                "result": payload,
+            }
         except Exception as exc:
-            error_message = str(exc)
-            results.append(
-                {
-                    "file": str(file),
-                    "ok": False,
-                    "error": error_message,
-                }
-            )
-            if not as_json:
-                typer.echo(f"[FAILED] {file}: {error_message}")
-            if stop_on_error:
-                break
+            return {
+                "file": str(file),
+                "ok": False,
+                "error": str(exc),
+            }
 
-    uploaded = sum(1 for item in results if item["ok"])
-    failed = len(results) - uploaded
+    if worker_count == 1:
+        for index, upload_plan in enumerate(planned_uploads):
+            result = run_one(index, upload_plan)
+            results[index] = result
+            if result["ok"]:
+                if not as_json and len(files) > 1:
+                    typer.echo(f"[OK] {upload_plan['file']}")
+            else:
+                if not as_json:
+                    typer.echo(f"[FAILED] {upload_plan['file']}: {result['error']}")
+                if stop_on_error:
+                    break
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_index = {
+                executor.submit(run_one, index, upload_plan): index
+                for index, upload_plan in enumerate(planned_uploads)
+            }
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                upload_plan = planned_uploads[index]
+                result = future.result()
+                results[index] = result
+                if result["ok"]:
+                    if not as_json:
+                        typer.echo(f"[OK] {upload_plan['file']}")
+                else:
+                    if not as_json:
+                        typer.echo(f"[FAILED] {upload_plan['file']}: {result['error']}")
+
+    finalized_results = [result for result in results if result is not None]
+    uploaded = sum(1 for item in finalized_results if item["ok"])
+    failed = len(finalized_results) - uploaded
 
     if len(files) == 1:
-        single = results[0]
+        single = finalized_results[0]
         if not single["ok"]:
             raise typer.BadParameter(single["error"])
         if as_json:
             emit(single["result"], as_json=True)
             return
-        typer.echo("上传成功。")
+        if no_wait:
+            typer.echo("上传任务已提交到服务器。")
+            typer.echo(f"Task ID: {single['result'].get('task_id') or '-'}")
+            typer.echo("现在可以关闭终端，服务器会继续处理。")
+        else:
+            typer.echo("上传成功。")
         emit(single["result"], as_json=True)
         return
 
     summary = {
         "ok": failed == 0,
+        "waited": not no_wait,
+        "jobs": worker_count,
         "uploaded_count": uploaded,
         "failed_count": failed,
-        "results": results,
+        "results": finalized_results,
     }
     if as_json:
         emit(summary, as_json=True)
         return
 
-    typer.echo(f"批量上传完成：成功 {uploaded}，失败 {failed}。")
+    if no_wait:
+        typer.echo(f"批量上传任务已提交：成功 {uploaded}，失败 {failed}。")
+        typer.echo("现在可以关闭终端，服务器会继续处理。")
+        typer.echo("后续可用 `colab docs task-status <task_id>` 查询单个任务状态。")
+    else:
+        typer.echo(f"批量上传完成：成功 {uploaded}，失败 {failed}。")
     if failed:
         raise typer.Exit(code=1)
 
