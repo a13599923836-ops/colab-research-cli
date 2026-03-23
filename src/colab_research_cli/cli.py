@@ -267,16 +267,21 @@ def stream_upload_one_document(
             "tags": tags,
         },
     )
+    upload_url = str(init_payload.get("upload_url") or "").strip()
     upload_path = str(init_payload.get("upload_path") or "").strip()
-    if not upload_path:
-        raise typer.BadParameter("服务器没有返回 upload_path。")
+    if not upload_url and not upload_path:
+        raise typer.BadParameter("服务器没有返回 upload_url 或 upload_path。")
+    target_url = upload_url or upload_path
 
     with file.open("rb") as fh:
-        with client(auth_token=current_token()) as c:
+        with httpx.Client(timeout=120, follow_redirects=True, trust_env=False) as c:
             response = c.put(
-                upload_path,
+                target_url,
                 content=fh,
-                headers={"Content-Type": content_type},
+                headers={
+                    "Authorization": f"Bearer {current_token()}",
+                    "Content-Type": content_type,
+                },
             )
     if response.status_code >= 400:
         content_type_header = response.headers.get("content-type", "")
