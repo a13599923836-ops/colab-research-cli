@@ -27,6 +27,8 @@ app.add_typer(access_app, name="access")
 app.add_typer(docs_app, name="docs")
 
 DEFAULT_BASE_URL = "https://paperless.colab-research.cloud"
+DEFAULT_CHUNK_THRESHOLD_MB = 5
+DEFAULT_CHUNK_SIZE_MB = 2
 CONFIG_PATH = Path(
     os.getenv(
         "COLAB_CLI_CONFIG_PATH",
@@ -283,6 +285,74 @@ def stream_upload_one_document(
                     "Content-Type": content_type,
                 },
             )
+    if response.status_code >= 400:
+        content_type_header = response.headers.get("content-type", "")
+        if "application/json" in content_type_header:
+            payload = response.json()
+            raise typer.BadParameter(str(payload.get("error") or payload))
+        raise typer.BadParameter(response.text.strip() or f"HTTP {response.status_code}")
+    return response.json()
+
+
+def chunked_upload_one_document(
+    file: Path,
+    *,
+    title: str,
+    document_type: str,
+    correspondent: str,
+    storage_path: str,
+    tags: list[str],
+    chunk_size_bytes: int,
+) -> Any:
+    content_type = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
+    file_size = file.stat().st_size
+    chunk_count = max(1, (file_size + chunk_size_bytes - 1) // chunk_size_bytes)
+    init_payload = api_request(
+        "POST",
+        "/documents/uploads/init",
+        json_body={
+            "filename": file.name,
+            "content_type": content_type,
+            "title": title,
+            "document_type": document_type,
+            "correspondent": correspondent,
+            "storage_path": storage_path,
+            "tags": tags,
+            "chunked": True,
+            "chunk_count": chunk_count,
+        },
+    )
+    chunk_url_template = str(init_payload.get("chunk_upload_url_template") or "").strip()
+    complete_url = str(init_payload.get("complete_url") or "").strip()
+    if not chunk_url_template or not complete_url:
+        raise typer.BadParameter("服务器没有返回完整的分片上传地址。")
+
+    token = current_token()
+    with httpx.Client(timeout=120, follow_redirects=True, trust_env=False) as c:
+        with file.open("rb") as fh:
+            for index in range(chunk_count):
+                chunk = fh.read(chunk_size_bytes)
+                if not chunk:
+                    raise typer.BadParameter(f"文件读取提前结束，缺少 chunk {index}。")
+                response = c.put(
+                    chunk_url_template.replace("{index}", str(index)),
+                    content=chunk,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/octet-stream",
+                    },
+                )
+                if response.status_code >= 400:
+                    content_type_header = response.headers.get("content-type", "")
+                    if "application/json" in content_type_header:
+                        payload = response.json()
+                        raise typer.BadParameter(str(payload.get("error") or payload))
+                    raise typer.BadParameter(response.text.strip() or f"HTTP {response.status_code}")
+
+        response = c.post(
+            complete_url,
+            headers={"Authorization": f"Bearer {token}"},
+        )
     if response.status_code >= 400:
         content_type_header = response.headers.get("content-type", "")
         if "application/json" in content_type_header:
@@ -717,6 +787,16 @@ def docs_upload(
         "--jobs",
         help="同时上传的文件数。建议从 2 到 4 开始。",
     ),
+    chunk_threshold_mb: int = typer.Option(
+        DEFAULT_CHUNK_THRESHOLD_MB,
+        "--chunk-threshold-mb",
+        help="仅在 --no-wait 下，大于该体积的文件自动走分片上传。",
+    ),
+    chunk_size_mb: int = typer.Option(
+        DEFAULT_CHUNK_SIZE_MB,
+        "--chunk-size-mb",
+        help="分片上传时每个 chunk 的大小。",
+    ),
     metadata_json: Path | None = typer.Option(
         None,
         "--metadata-json",
@@ -740,6 +820,10 @@ def docs_upload(
         raise typer.BadParameter("当前建议把 --jobs 控制在 6 以内。")
     if stop_on_error and jobs > 1:
         raise typer.BadParameter("--stop-on-error 暂不支持和 --jobs > 1 同时使用。")
+    if chunk_threshold_mb < 1:
+        raise typer.BadParameter("--chunk-threshold-mb 不能小于 1。")
+    if chunk_size_mb < 1:
+        raise typer.BadParameter("--chunk-size-mb 不能小于 1。")
 
     if len(files) > 1 and title and metadata_json is None:
         raise typer.BadParameter("批量上传时不支持给所有文件共用同一个 --title，请改为单文件上传或移除 --title。")
@@ -795,14 +879,25 @@ def docs_upload(
         file = upload_plan["file"]
         try:
             if no_wait:
-                payload = stream_upload_one_document(
-                    file,
-                    title=upload_plan["title"],
-                    document_type=upload_plan["document_type"],
-                    correspondent=upload_plan["correspondent"],
-                    storage_path=upload_plan["storage_path"],
-                    tags=upload_plan["tags"],
-                )
+                if file.stat().st_size >= chunk_threshold_mb * 1024 * 1024:
+                    payload = chunked_upload_one_document(
+                        file,
+                        title=upload_plan["title"],
+                        document_type=upload_plan["document_type"],
+                        correspondent=upload_plan["correspondent"],
+                        storage_path=upload_plan["storage_path"],
+                        tags=upload_plan["tags"],
+                        chunk_size_bytes=chunk_size_mb * 1024 * 1024,
+                    )
+                else:
+                    payload = stream_upload_one_document(
+                        file,
+                        title=upload_plan["title"],
+                        document_type=upload_plan["document_type"],
+                        correspondent=upload_plan["correspondent"],
+                        storage_path=upload_plan["storage_path"],
+                        tags=upload_plan["tags"],
+                    )
             else:
                 payload = upload_one_document(
                     file,
