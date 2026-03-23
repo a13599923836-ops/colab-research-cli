@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colab-research-cli"
+version = "0.1.0"
+description = "CLI for Colab Research Paperless workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Colab Research" }
+]
+dependencies = [
+  "httpx>=0.27,<1",
+  "typer>=0.24,<1"
+]
+
+[project.urls]
+Homepage = "https://github.com/a13599923836-ops/colab-research-cli"
+Repository = "https://github.com/a13599923836-ops/colab-research-cli"
+
+[project.scripts]
+colab = "colab_research_cli.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
