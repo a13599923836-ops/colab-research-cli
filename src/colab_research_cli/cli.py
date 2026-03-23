@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import mimetypes
 import os
 import re
 import shlex
@@ -241,6 +242,49 @@ def upload_one_document(
             data=form_data,
             files={"document": (file.name, fh, "application/octet-stream")},
         )
+
+
+def stream_upload_one_document(
+    file: Path,
+    *,
+    title: str,
+    document_type: str,
+    correspondent: str,
+    storage_path: str,
+    tags: list[str],
+) -> Any:
+    content_type = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
+    init_payload = api_request(
+        "POST",
+        "/documents/uploads/init",
+        json_body={
+            "filename": file.name,
+            "content_type": content_type,
+            "title": title,
+            "document_type": document_type,
+            "correspondent": correspondent,
+            "storage_path": storage_path,
+            "tags": tags,
+        },
+    )
+    upload_path = str(init_payload.get("upload_path") or "").strip()
+    if not upload_path:
+        raise typer.BadParameter("服务器没有返回 upload_path。")
+
+    with file.open("rb") as fh:
+        with client(auth_token=current_token()) as c:
+            response = c.put(
+                upload_path,
+                content=fh,
+                headers={"Content-Type": content_type},
+            )
+    if response.status_code >= 400:
+        content_type_header = response.headers.get("content-type", "")
+        if "application/json" in content_type_header:
+            payload = response.json()
+            raise typer.BadParameter(str(payload.get("error") or payload))
+        raise typer.BadParameter(response.text.strip() or f"HTTP {response.status_code}")
+    return response.json()
 
 
 def terminal_is_interactive() -> bool:
@@ -745,15 +789,25 @@ def docs_upload(
     def run_one(index: int, upload_plan: dict[str, Any]) -> dict[str, Any]:
         file = upload_plan["file"]
         try:
-            payload = upload_one_document(
-                file,
-                title=upload_plan["title"],
-                document_type=upload_plan["document_type"],
-                correspondent=upload_plan["correspondent"],
-                storage_path=upload_plan["storage_path"],
-                tags=upload_plan["tags"],
-                wait_for_result=not no_wait,
-            )
+            if no_wait:
+                payload = stream_upload_one_document(
+                    file,
+                    title=upload_plan["title"],
+                    document_type=upload_plan["document_type"],
+                    correspondent=upload_plan["correspondent"],
+                    storage_path=upload_plan["storage_path"],
+                    tags=upload_plan["tags"],
+                )
+            else:
+                payload = upload_one_document(
+                    file,
+                    title=upload_plan["title"],
+                    document_type=upload_plan["document_type"],
+                    correspondent=upload_plan["correspondent"],
+                    storage_path=upload_plan["storage_path"],
+                    tags=upload_plan["tags"],
+                    wait_for_result=True,
+                )
             return {
                 "file": str(file),
                 "ok": True,

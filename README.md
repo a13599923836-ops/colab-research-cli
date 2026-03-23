@@ -89,6 +89,7 @@ colab docs update <doc_id> --title 新标题 --tag 待分类 --json
 - if you choose LLM classification, the CLI prints a prompt you can send to another model
 - save the returned JSON and pass it back with `--metadata-json`
 - add `--no-wait` if you want the CLI to return as soon as the server accepts the file
+- `--no-wait` uses a dedicated init/content upload flow so large files are less likely to get stuck on the old multipart path
 - add `--jobs 3` or similar for bounded upload concurrency
 - once `--no-wait` reports accepted task IDs, the sender may close the terminal
 - use `colab docs task-status <task_id>` later to query a single async upload task
