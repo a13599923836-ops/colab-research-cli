@@ -224,6 +224,7 @@ def upload_one_document(
     tags: list[str],
     wait_for_result: bool,
 ) -> Any:
+    content_type = content_type_for_upload(file)
     form_data: dict[str, str] = {}
     for key, value in (
         ("title", title),
@@ -242,8 +243,26 @@ def upload_one_document(
             "/documents/upload",
             params={"wait": "true" if wait_for_result else "false"},
             data=form_data,
-            files={"document": (file.name, fh, "application/octet-stream")},
+            files={"document": (file.name, fh, content_type)},
         )
+
+
+def content_type_for_upload(file: Path) -> str:
+    suffix = file.suffix.lower()
+    text_types = {
+        ".txt": "text/plain; charset=utf-8",
+        ".md": "text/markdown; charset=utf-8",
+        ".markdown": "text/markdown; charset=utf-8",
+        ".csv": "text/csv; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".log": "text/plain; charset=utf-8",
+        ".yaml": "application/yaml; charset=utf-8",
+        ".yml": "application/yaml; charset=utf-8",
+        ".rst": "text/plain; charset=utf-8",
+    }
+    if suffix in text_types:
+        return text_types[suffix]
+    return mimetypes.guess_type(file.name)[0] or "application/octet-stream"
 
 
 def stream_upload_one_document(
@@ -255,7 +274,7 @@ def stream_upload_one_document(
     storage_path: str,
     tags: list[str],
 ) -> Any:
-    content_type = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
+    content_type = content_type_for_upload(file)
     init_payload = api_request(
         "POST",
         "/documents/uploads/init",
@@ -304,7 +323,7 @@ def chunked_upload_one_document(
     tags: list[str],
     chunk_size_bytes: int,
 ) -> Any:
-    content_type = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
+    content_type = content_type_for_upload(file)
     file_size = file.stat().st_size
     chunk_count = max(1, (file_size + chunk_size_bytes - 1) // chunk_size_bytes)
     init_payload = api_request(
